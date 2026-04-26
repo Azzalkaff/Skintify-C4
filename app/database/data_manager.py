@@ -1,0 +1,188 @@
+"""
+Hybrid Repository Pattern untuk DataManager
+Menjadi Single Source of Truth: mencoba load SQLite terlebih dahulu. 
+Jika kosong (belum ada scraping interaktif dari terminal), akan membaca file JSON fallback.
+"""
+
+import json
+import logging
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+from app.database.engine import SessionLocal
+from app.database.models import SociollaReferensi, Produk
+from app.services.analyzer import IngredientDatabase, SkincareAnalyzer
+from app.services.weather import WeatherService
+
+logger = logging.getLogger(__name__)
+
+class DataManager:
+    """
+    Facade class yang menggabungkan SQLite, JSON Fallback, Analyzer, dan WeatherService.
+    Memberikan satu antarmuka yang bersih untuk digunakan oleh main.py.
+    """
+    def __init__(self, data_dir: str = "data"):
+        self.data_dir = Path(data_dir)
+        self.ingredient_db = IngredientDatabase(self.data_dir)
+        
+        # Cache memory
+        self._categories = ["All"]
+        self._cached_products = None 
+        
+        # Mapping Kategori untuk Harmonisasi UI (Pilihan A)
+        self.CATEGORY_MAP = {
+            "Face Gel": "Moisturizer",
+            "Micellar Water": "Face Wash",
+            "Cleanser": "Face Wash",
+            "Face Wash": "Face Wash",
+            "Moisturizer": "Moisturizer",
+            "Sunscreen": "Sunscreen",
+            "Serum": "Serum",
+            "Toner": "Serum" # Digabung ke serum/treatment untuk simplifikasi
+        }
+
+    def get_ingredient_profile(self, product: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.ingredient_db.is_loaded():
+            return None
+        raw = product.get("ingredients", "")
+        if not raw:
+            return None
+        ingredient_set = {item.strip().lower() for item in raw.split(',') if item.strip()}
+        return self.ingredient_db.get_aggregate(ingredient_set)
+
+    @property
+    def categories(self) -> List[str]:
+        if len(self._categories) > 1:
+            return self._categories
+            
+        with SessionLocal() as session:
+            cats = session.query(SociollaReferensi.category).distinct().all()
+            if cats:
+                clean_cats = {c[0] for c in cats if c[0] and c[0] != "Uncategorized"}
+                self._categories = ["All"] + sorted(list(clean_cats))
+            else:
+                # Kategori Standar UI
+                self._categories = ["All", "Face Wash", "Moisturizer", "Sunscreen", "Serum"]
+        return self._categories
+
+    def get_paginated_products(self, page: int = 1, items_per_page: int = 12, category_filter: str = "All") -> Dict[str, Any]:
+        """Pencarian efisien Big-O(1) Pagination limit-offset pada SQL"""
+        with SessionLocal() as session:
+            query = session.query(SociollaReferensi)
+            if category_filter != "All":
+                query = query.filter(SociollaReferensi.category == category_filter)
+                
+            total_items = query.count()
+            
+            # [HYBRID FALLBACK]
+            # Jika database hampir kosong (< 10 produk), gunakan JSON fallback agar data lengkap muncul
+            if total_items < 10:
+                return self._fallback_json_load(page, items_per_page, category_filter)
+
+            total_pages = (total_items + items_per_page - 1) // items_per_page
+            safe_page = max(1, min(page, total_pages))
+            
+            results = query.offset((safe_page - 1) * items_per_page).limit(items_per_page).all()
+            
+            items = []
+            for r in results:
+                # Data SQLite -> Dict yang cocok dengan ekspektasi Frontend
+                items.append({
+                    "brand": r.brand,
+                    "product_name": r.product_name,
+                    "category": r.category,
+                    "slug": r.product_name.lower().replace(" ", "-"),
+                    "ingredients": "", # Tidak selalu ditarik full oleh ref
+                    "min_price": r.min_price,
+                    "rating": r.rating_sociolla,
+                    "image_url": r.url_sociolla,
+                })
+                
+            return {
+                "items": items,
+                "total_pages": total_pages,
+                "current_page": safe_page,
+                "total_items": total_items
+            }
+
+    def _fallback_json_load(self, page, items_per_page, category_filter) -> Dict[str, Any]:
+        """Menyediakan data dari file JSON hasil Scraping dengan In-Memory Caching."""
+        
+        # 1. Cek apakah cache sudah terisi
+        if self._cached_products is None:
+            json_file = Path("app/scraping/data/products_sociolla_ALL.json")
+            
+            self._cached_products = []
+            if json_file.exists():
+                try:
+                    with json_file.open('r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        self._cached_products = data if isinstance(data, list) else data.get("products", [])
+                except Exception as e:
+                    logger.error(f"Gagal memuat JSON fallback: {e}")
+        
+        # 2. Filter data dari Memori (Bukan Disk) - Kecepatan O(N) di RAM
+        def matches_filter(prod_cat, filter_cat):
+            if filter_cat == "All": return True
+            # Cek pemetaan: misal prod_cat="Face Gel" di-map ke "Moisturizer"
+            mapped_cat = self.CATEGORY_MAP.get(prod_cat, prod_cat)
+            return mapped_cat.lower() == filter_cat.lower()
+
+        filtered_products = [
+            p for p in self._cached_products 
+            if matches_filter(p.get("category", ""), category_filter)
+        ]
+                
+        total_items = len(filtered_products)
+        if total_items == 0:
+            return {"items": [], "total_pages": 1, "current_page": 1, "total_items": 0}
+            
+        total_pages = (total_items + items_per_page - 1) // items_per_page
+        safe_page =max(1, min(page, total_pages))
+        start_idx = (safe_page - 1) * items_per_page
+        
+        return {
+            "items": filtered_products[start_idx:start_idx+items_per_page],
+            "total_pages": total_pages,
+            "current_page": safe_page,
+            "total_items": total_items
+        }
+
+    def analyze_routine(self, routine_list: List[Dict[str, Any]], kota: str = "") -> Dict[str, Any]:
+        result = {"warnings": [], "suggestions": [], "weather": None, "status": "empty"}
+        if not routine_list:
+            return result
+
+        result["status"] = "safe" 
+        routine_ingredients = set()
+        
+        for prod in routine_list:
+            ingredients = prod.get("ingredients", "")
+            if ingredients:
+                routine_ingredients.update(item.strip().lower() for item in ingredients.split(","))
+
+        result["warnings"].extend(SkincareAnalyzer.check_routine_safety(routine_ingredients))
+
+        if self.ingredient_db.is_loaded():
+            aggregate = self.ingredient_db.get_aggregate(routine_ingredients)
+            result["warnings"].extend(SkincareAnalyzer.check_comedogenicity(aggregate))
+            result["warnings"].extend(SkincareAnalyzer.check_irritancy_load(aggregate))
+
+        weather = WeatherService.fetch_weather(kota)
+        if weather["status"] == "success":
+            result["weather"] = weather
+            uv, hum = weather["uv_index"], weather["humidity"]
+
+            has_photosensitive = any(
+                kw in ing for ing in routine_ingredients 
+                for kw in SkincareAnalyzer.ACTIVE_INGREDIENTS["retinol"] | SkincareAnalyzer.ACTIVE_INGREDIENTS["aha_bha"]
+            )
+            
+            if uv >= 6 and has_photosensitive:
+                result["warnings"].append(f"🛑 UV Index {uv} (Sangat Tinggi)! Hindari Retinol/AHA pagi ini atau WAJIB pakai sunscreen tebal.")
+                result["status"] = "danger"
+            
+            if hum < 50:
+                result["suggestions"].append(f"💧 Kelembapan {hum}% (Kering). Gunakan pelembap tebal.")
+
+        return result

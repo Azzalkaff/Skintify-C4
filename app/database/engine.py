@@ -1,0 +1,271 @@
+"""
+database.py — Engine, Session, dan fungsi simpan ke DB
+Mendukung multi-platform: Tokopedia & Lazada
+"""
+
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+from dotenv import load_dotenv
+
+from app.database.models import Base, Toko, Produk, HasilPencarian, SociollaReferensi
+
+load_dotenv()
+
+
+# ── Engine & Session ──────────────────────────────────────────────────────────
+
+def buat_engine():
+    url = os.getenv("DATABASE_URL", "sqlite:///tokopedia.db")
+    if url.startswith("sqlite"):
+        return create_engine(url, connect_args={"check_same_thread": False})
+    return create_engine(url)
+
+
+engine     = buat_engine()
+SessionLocal = sessionmaker(bind=engine)
+
+
+def init_db():
+    """Buat semua tabel jika belum ada."""
+    Base.metadata.create_all(bind=engine)
+    print("✅ Database siap.")
+
+
+# ── Normalisasi dict scraper → format unified ─────────────────────────────────
+
+def _normalize_toko(platform: str, raw: dict) -> dict:
+    """
+    Konversi dict toko dari scraper (Tokopedia/Lazada) ke format unified.
+
+    Tokopedia keys : shop_id, nama, kota, tier, url
+    Lazada keys    : seller_id, nama, kota, is_lazmall
+    """
+    if platform == "tokopedia":
+        return {
+            "platform":    "tokopedia",
+            "shop_id":     raw["shop_id"],
+            "nama":        raw.get("nama", ""),
+            "kota":        raw.get("kota", ""),
+            "tier":        raw.get("tier", 0),
+            "is_official": raw.get("tier", 0) >= 1,   # 1=official, 2=power merchant
+            "url":         raw.get("url", ""),
+        }
+    elif platform == "lazada":
+        return {
+            "platform":    "lazada",
+            "shop_id":     raw["seller_id"],
+            "nama":        raw.get("nama", ""),
+            "kota":        raw.get("kota", ""),
+            "tier":        None,
+            "is_official": raw.get("is_lazmall", False),
+            "url":         None,
+        }
+    else:
+        raise ValueError(f"Platform tidak dikenal: {platform}")
+
+
+def _normalize_produk(platform: str, raw: dict) -> dict:
+    """
+    Konversi dict produk dari scraper (Tokopedia/Lazada) ke format unified.
+
+    Tokopedia keys : product_id, shop_id, nama, url, gambar, harga, harga_teks,
+                     harga_asli, diskon_persen, rating, kategori, label_badge, free_ongkir
+    Lazada keys    : item_id, seller_id, nama, url, gambar, harga, harga_teks,
+                     harga_asli, diskon_persen, rating, jumlah_review, terjual,
+                     in_stock, is_sponsored
+    """
+    if platform == "tokopedia":
+        return {
+            "platform":      "tokopedia",
+            "product_id":    raw["product_id"],
+            "shop_id":       raw["shop_id"],
+            "keyword":       raw["keyword"],
+            "nama":          raw.get("nama", ""),
+            "url":           raw.get("url", ""),
+            "gambar":        raw.get("gambar", ""),
+            "harga":         raw.get("harga", 0.0),
+            "harga_teks":    raw.get("harga_teks", ""),
+            "harga_asli":    raw.get("harga_asli", 0.0),
+            "diskon_persen": raw.get("diskon_persen", 0),
+            "rating":        raw.get("rating", 0.0),
+            "jumlah_review": raw.get("jumlah_review", 0),
+            "terjual":       raw.get("terjual", 0),
+            "kategori":      raw.get("kategori", ""),
+            "label_badge":   raw.get("label_badge", ""),
+            "free_ongkir":   raw.get("free_ongkir", 0),
+            "in_stock":      None,
+            "is_sponsored":  None,
+        }
+    elif platform == "lazada":
+        return {
+            "platform":      "lazada",
+            "product_id":    raw["item_id"],
+            "shop_id":       raw["seller_id"],
+            "keyword":       raw["keyword"],
+            "nama":          raw.get("nama", ""),
+            "url":           raw.get("url", ""),
+            "gambar":        raw.get("gambar", ""),
+            "harga":         raw.get("harga", 0.0),
+            "harga_teks":    raw.get("harga_teks", ""),
+            "harga_asli":    raw.get("harga_asli", 0.0),
+            "diskon_persen": raw.get("diskon_persen", 0),
+            "rating":        raw.get("rating", 0.0),
+            "jumlah_review": raw.get("jumlah_review", 0),
+            "terjual":       raw.get("terjual", 0),
+            "kategori":      None,
+            "label_badge":   None,
+            "free_ongkir":   None,
+            "in_stock":      raw.get("in_stock", True),
+            "is_sponsored":  raw.get("is_sponsored", False),
+        }
+    else:
+        raise ValueError(f"Platform tidak dikenal: {platform}")
+
+
+# ── Fungsi simpan utama ───────────────────────────────────────────────────────
+
+def simpan_hasil(
+    session:      Session,
+    platform:     str,
+    keyword:      str,
+    produk_list:  list,
+    toko_list:    list,
+    total_data:   int,
+):
+    """
+    Simpan toko + produk ke database untuk platform tertentu.
+    Skip duplikat (unique constraint per platform+shop_id / platform+product_id+keyword).
+
+    platform: 'tokopedia' | 'lazada'
+    """
+
+    # 1. Normalisasi semua dict ke format unified
+    toko_norm   = [_normalize_toko(platform, t)   for t in toko_list]
+    produk_norm = [_normalize_produk(platform, p) for p in produk_list]
+
+    # 2. Simpan / ambil toko dari DB
+    toko_map_db = {}   # shop_id → Toko ORM object
+    for t in toko_norm:
+        toko_db = (
+            session.query(Toko)
+            .filter_by(platform=t["platform"], shop_id=t["shop_id"])
+            .first()
+        )
+        if not toko_db:
+            toko_db = Toko(
+                platform    = t["platform"],
+                shop_id     = t["shop_id"],
+                nama        = t["nama"],
+                kota        = t["kota"],
+                tier        = t["tier"],
+                is_official = t["is_official"],
+                url         = t["url"],
+            )
+            session.add(toko_db)
+            session.flush()   # dapat id sebelum commit
+        toko_map_db[t["shop_id"]] = toko_db
+
+    # 3. Simpan produk — skip duplikat
+    baru, lewati = 0, 0
+    for p in produk_norm:
+        ada = (
+            session.query(Produk)
+            .filter_by(
+                platform   = p["platform"],
+                product_id = p["product_id"],
+                keyword    = p["keyword"],
+            )
+            .first()
+        )
+        if ada:
+            lewati += 1
+            continue
+
+        toko_db = toko_map_db.get(p["shop_id"])
+        produk_db = Produk(
+            platform      = p["platform"],
+            product_id    = p["product_id"],
+            keyword       = p["keyword"],
+            nama          = p["nama"],
+            url           = p["url"],
+            gambar        = p["gambar"],
+            harga         = p["harga"],
+            harga_teks    = p["harga_teks"],
+            harga_asli    = p["harga_asli"],
+            diskon_persen = p["diskon_persen"],
+            rating        = p["rating"],
+            jumlah_review = p["jumlah_review"],
+            terjual       = p["terjual"],
+            kategori      = p["kategori"],
+            label_badge   = p["label_badge"],
+            free_ongkir   = p["free_ongkir"],
+            in_stock      = p["in_stock"],
+            is_sponsored  = p["is_sponsored"],
+            toko          = toko_db,
+        )
+        session.add(produk_db)
+        baru += 1
+
+    # 4. Catat metadata sesi pencarian
+    sesi = HasilPencarian(
+        platform      = platform,
+        keyword       = keyword,
+        total_data    = total_data,
+        jumlah_produk = len(produk_list),
+        jumlah_toko   = len(toko_list),
+    )
+    session.add(sesi)
+    session.commit()
+
+    print(f"   💾 [{platform}] Disimpan: {baru} produk baru, {lewati} dilewati (duplikat)")
+
+
+# ── Simpan referensi Sociolla ─────────────────────────────────────────────────
+
+def simpan_sociolla_referensi(session: Session, produk_list: list):
+    """
+    Simpan daftar produk Sociolla sebagai referensi keyword ke DB.
+    Skip jika sudah ada (brand + product_name).
+    """
+    baru = 0
+    for p in produk_list:
+        ada = (
+            session.query(SociollaReferensi)
+            .filter_by(brand=p["brand"], product_name=p["product_name"])
+            .first()
+        )
+        if ada:
+            continue
+
+        ref = SociollaReferensi(
+            product_name         = p["product_name"],
+            brand                = p["brand"],
+            keyword_digunakan    = p.get("keyword_digunakan", ""),
+            category             = p.get("category", ""),
+            min_price            = p.get("min_price", 0),
+            max_price            = p.get("max_price", 0),
+            harga_setelah_diskon = p.get("min_price_after_discount"),
+            diskon               = p.get("discount_range"),
+            rating_sociolla      = p.get("average_rating", 0),
+            total_reviews        = p.get("total_reviews", 0),
+            url_sociolla         = p.get("url", ""),
+            is_in_stock          = p.get("is_in_stock", True),
+        )
+        session.add(ref)
+        baru += 1
+
+    session.commit()
+    print(f"   📚 Referensi Sociolla: {baru} produk baru disimpan ke DB")
+
+
+def tandai_sudah_di_scrape(session: Session, brand: str, product_name: str):
+    """Update flag sudah_di_scrape = True setelah scraping selesai."""
+    ref = (
+        session.query(SociollaReferensi)
+        .filter_by(brand=brand, product_name=product_name)
+        .first()
+    )
+    if ref:
+        ref.sudah_di_scrape = True
+        session.commit()

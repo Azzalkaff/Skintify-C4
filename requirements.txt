@@ -1,0 +1,22 @@
+# --- UI & Web Framework ---
+nicegui==3.7.1
+pywebview
+
+# --- Data & Database ---
+SQLAlchemy
+psycopg2-binary
+
+# --- Scraping & Automation ---
+requests
+beautifulsoup4
+aiohttp
+
+# --- Utils & Logic ---
+python-dotenv
+rapidfuzz
+pydantic
+
+# --- YouTube Scraper (opsional, jalankan manual) ---
+# yt-dlp dan faster-whisper tidak otomatis di-install karena berat
+# Install manual jika diperlukan:
+#   pip install yt-dlp faster-whisper
