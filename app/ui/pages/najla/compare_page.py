@@ -4,6 +4,65 @@ from app.ui.components import UIComponents
 from app.auth.auth import AuthManager
 import re
 
+def get_tokopedia_price(p):
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect("data/db/tokopedia.db")
+        cursor = conn.cursor()
+
+        keyword = p['product_name'].split()[0]
+
+        cursor.execute("""
+            SELECT harga
+            FROM produk
+            WHERE nama LIKE ?
+        """, (f"%{keyword}%",))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            return None
+
+        harga_list = [r[0] for r in rows if r[0]]
+        return min(harga_list) if harga_list else None
+
+    except:
+        return None
+    
+def show_all_ingredients(ingredients):
+    with ui.dialog() as dialog, ui.card():
+        ui.label("Kandungan & Fungsinya").classes("font-bold mb-2")
+
+        for ing in ingredients:
+            label = ing.lower()
+
+            if "niacinamide" in label:
+                desc = "Brightening ✨"
+            elif "hyaluronic" in label:
+                desc = "Hydrating 💧"
+            elif "centella" in label:
+                desc = "Soothing 🌿"
+            elif "salicylic" in label:
+                desc = "Acne care 🔥"
+            else:
+                desc = ""
+
+            ui.label(f"{ing} {desc}")
+
+    dialog.open()
+
+def get_best_price(p):
+    prices = [
+        p.get("min_price"),              # Sociolla
+        get_tokopedia_price(p),          # Tokopedia
+        p.get("price_lazada")            # Lazada
+    ]
+
+    valid = [x for x in prices if x]
+    return min(valid) if valid else 0
+
 def show_page():
     """MISI NAJLA: Membuat Logika Perbandingan Produk"""
     
@@ -240,9 +299,11 @@ def show_page():
                 for p in selected_data:
                     with ui.column().classes("w-48 text-center gap-1"):
 
+                        tokped_price = get_tokopedia_price(p)
+
                         prices = {
                             "Sociolla": p.get("min_price"),
-                            "Tokopedia": p.get("price_tokopedia"),
+                            "Tokopedia": tokped_price,
                             "Lazada": p.get("price_lazada"),
                         }
 
@@ -261,7 +322,7 @@ def show_page():
 
                         # 👇 tampilkan SEMUA marketplace (termasuk yang kosong)
                         for name, price in prices.items():
-                            if name != cheapest_market:
+                            if valid and name != cheapest_market:
                                 if price:
                                     ui.label(f"{name}: {format_rp(price)}")\
                                         .classes("text-xs text-gray-400")
@@ -297,14 +358,27 @@ def show_page():
                             ui.label("-")
             
             with ui.row().classes("items-center gap-6 flex-nowrap"):
-                ui.label("Bahan Aktif").classes("w-40")
+                ui.label("Kandungan Utama").classes("w-40")
 
                 for p in selected_data:
                     with ui.column().classes("w-48 items-center gap-1"):
 
                         raw = p.get("ingredients_raw") or p.get("ingredients") or ""
                         text = re.sub(r'<[^>]+>', '', raw)
-                        ingredients = [i.strip() for i in text.split(",") if i.strip()]
+                        skip = [
+                            "aqua", "water", "parfum", "fragrance",
+                            "butylene glycol", "propylene glycol",
+                            "glycerin"
+                        ]
+
+                        ingredients = [
+                            i.strip() for i in text.split(",")
+                            if i.strip() and i.lower() not in skip
+                        ]
+
+                        for ing in ingredients[:2]:
+                            if len(ingredients) > 2:
+                                 ui.label("...").classes("text-xs text-gray-400")
 
                         if not ingredients:
                             ui.label("-")
@@ -315,40 +389,123 @@ def show_page():
                                 )
 
                             if len(ingredients) > 3:
-                                ui.label(f"+{len(ingredients)-3}").classes(
-                                    "px-2 py-1 text-xs border rounded-full"
-                                )
+                                ui.button(
+                                    f"+{len(ingredients)-3} lainnya",
+                                    on_click=lambda e, ing=ingredients: show_all_ingredients(ing)
+                                ).classes("text-xs bg-gray-100 px-2 py-1 rounded-full")
             # ================= VISUALISASI =================
             with ui.card().classes("w-full p-4 mt-4"):
                 ui.label("Perbandingan Visual Produk").classes("font-semibold mb-3")
 
+                def get_score(p):
+                    price = get_best_price(p)
+                    rating = p.get('average_rating') or 0
+
+                    if not price:
+                        return 0
+
+                    return rating / price
+
+
+                # cari best
+                best_value = max(selected_data, key=get_score)
+                best_price = min(selected_data, key=lambda x: get_best_price(x) or 999999)
+                best_rating = max(selected_data, key=lambda x: x.get('average_rating') or 0)
+
                 names = [p['brand'] for p in selected_data]
-                prices = [p.get('min_price') or 0 for p in selected_data]
+                prices = [get_best_price(p) for p in selected_data]
                 ratings = [p.get('average_rating') or 0 for p in selected_data]
 
                 # ===== CHART HARGA =====
-                ui.label("Harga Produk").classes("text-sm text-gray-500")
+                ui.label("💰 Perbandingan Harga (lebih murah lebih baik)").classes("text-sm text-gray-500")
+                min_price = min(prices)
 
                 ui.echart({
-                    'xAxis': {'type': 'category', 'data': names},
+                    'xAxis': {
+                        'type': 'category',
+                        'data': names
+                    },
                     'yAxis': {'type': 'value'},
                     'series': [{
                         'type': 'bar',
-                        'data': prices
+                        'data': [
+                            {
+                                'value': v,
+                                'itemStyle': {
+                                    'color': '#22c55e' if v == min_price else '#f472b6'
+                                }
+                            }
+                            for v in prices
+                        ],
+                        'label': {
+                            'show': True,
+                            'position': 'top'
+                        }
                     }]
-                }).classes("w-full h-48 mb-4")
+                }).classes("w-full h-64")
 
                 # ===== CHART RATING =====
-                ui.label("Rating Produk").classes("text-sm text-gray-500")
+                ui.label("⭐ Perbandingan Rating (lebih tinggi lebih baik)").classes("text-sm text-gray-500")
+
+                max_rating = max(ratings)
+
+                chart_data = []
+                for v in ratings:
+                    if v == max_rating:
+                        chart_data.append({
+                            'value': v,
+                            'itemStyle': {'color': '#facc15'}  # kuning (best)
+                        })
+                    else:
+                        chart_data.append({
+                            'value': v,
+                            'itemStyle': {'color': '#60a5fa'}  # biru biasa
+                        })
 
                 ui.echart({
                     'xAxis': {'type': 'category', 'data': names},
-                    'yAxis': {'type': 'value'},
+                    'yAxis': {
+                        'type': 'value',
+                        'max': 5
+                    },
                     'series': [{
                         'type': 'bar',
-                        'data': ratings
+                        'data': chart_data,
+                        'label': {
+                            'show': True,
+                            'position': 'top',
+                            'formatter': '{c} ⭐'
+                        }
                     }]
-                }).classes("w-full h-48")
+                }).classes("w-full h-64")
+
+                ui.label("📊 Ringkasan Perbandingan").classes("text-lg font-semibold mt-4")
+
+                with ui.row().classes("gap-4"):
+
+                    # 🏆 BEST VALUE
+                    with ui.card().classes("p-4 w-72"):
+                        ui.label(f"🏆 Paling Worth It: {best_value['brand']}")\
+                            .classes("font-bold text-green-600")
+
+                        ui.label("✔ Kombinasi harga & rating terbaik")\
+                            .classes("text-sm text-gray-600")
+
+                    # 💰 TERMURAH
+                    with ui.card().classes("p-4 w-72"):
+                        ui.label(f"💰 Paling Murah: {best_price['brand']}")\
+                            .classes("font-bold text-pink-500")
+
+                        ui.label("✔ Cocok kalau budget minim")\
+                            .classes("text-sm text-gray-600")
+
+                    # ⭐ RATING
+                    with ui.card().classes("p-4 w-72"):
+                        ui.label(f"⭐ Rating Tertinggi: {best_rating['brand']}")\
+                            .classes("font-bold text-yellow-500")
+
+                        ui.label("✔ Kualitas paling bagus dari review")\
+                            .classes("text-sm text-gray-600")
 
     render()
     # --- AKHIR AREA BELAJAR ---
