@@ -93,16 +93,19 @@ def show_page():
                         subjudul=f'Tipe kulit: {tipe_kulit}'
                     )
 
-                    # Simpan ke database kalau fungsinya ada
+                    # Simpan ke database permanen
                     email = app.storage.user.get('email')
                     if email:
                         try:
-                            data_mgr.update_user_profile(
-                                email       = email,
-                                skin_type   = tipe_kulit,
+                            from app.database.database_manager import BasisData
+                            BasisData.simpan_profil_kulit(
+                                email             = email,
+                                skin_type         = tipe_kulit,
+                                avoid_ingredients = hindari_kandungan,
+                                skin_issues       = masalah_kulit,
                             )
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f'[onboarding] Gagal simpan ke DB: {e}')
 
                     ui.notify('Profil berhasil disimpan! ✨', color='positive')
 

@@ -19,9 +19,6 @@ ui.add_head_html('<link href="/static/style.css" rel="stylesheet">', shared=True
 app.add_static_files('/static', style_dir)
 
 # 3. Daftar Halaman (Kontrak Kerja Tim)
-# Syaqila: home, wishlist
-# Najla: compare, stats
-# Falisha: profile, onboarding
 PAGES = {
     '/': 'syaqila.home_page',
     '/search': 'syhid.search_page',
@@ -33,10 +30,28 @@ PAGES = {
     '/login': 'login_page',
 }
 
+
+def muat_profil_ke_storage(email: str):
+    """
+    Load data profil user dari DB ke app.storage.user.
+    Dipanggil setelah login agar skin_type dll langsung tersedia
+    tanpa perlu isi onboarding lagi.
+    """
+    try:
+        data_user = BasisData.ambil_pengguna_by_identifier(email)
+        if data_user:
+            app.storage.user['email']             = data_user.get('email', email)
+            app.storage.user['username']          = data_user.get('username', '')
+            app.storage.user['skin_type']         = data_user.get('skin_type', '')
+            app.storage.user['avoid_ingredients'] = data_user.get('avoid_ingredients', [])
+            app.storage.user['skin_issues']       = data_user.get('skin_issues', [])
+    except Exception as e:
+        logger.error(f"[muat_profil] Gagal load profil dari DB: {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  HELPER RIWAYAT AKTIVITAS
-#  Dipanggil oleh halaman lain (compare, search, wishlist) untuk mencatat log.
-#  Contoh pemakaian di compare_page.py:
+#  Contoh pemakaian di halaman lain:
 #    from main import tambah_riwayat
 #    tambah_riwayat('compare_arrows', 'blue', 'Membandingkan 2 produk', 'Wardah vs The Ordinary')
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,51 +66,40 @@ def tambah_riwayat(icon: str, color: str, judul: str, subjudul: str = ''):
         'subjudul': subjudul,
         'waktu':    datetime.datetime.now().strftime('%d %b %Y, %H:%M'),
     })
-    app.storage.user['activity_log'] = riwayat[:20]   # max 20 entri
+    app.storage.user['activity_log'] = riwayat[:20]
 
 
 # 4. Route Khusus: Halaman Utama (/)
 @ui.page('/')
 def index():
-    # Belum login → ke login
     if not app.storage.user.get('authenticated'):
         return ui.navigate.to('/login')
-    # Sudah login tapi belum isi onboarding → ke onboarding
-    if not app.storage.user.get('skin_type'):
-        app.storage.user['onboarding_mode'] = None   # pastikan mode bukan 'edit'
-        return ui.navigate.to('/onboarding')
-    # Semua OK → tampilkan home
+    # Langsung ke home — tidak ada cek skin_type di sini
+    # skin_type sudah dimuat dari DB oleh login_page saat login
     from app.ui.pages.syaqila.home_page import show_page
     return show_page()
 
 
 # 5. Fungsi Pembungkus Route yang Aman
 def create_safe_route(path, module_name):
-    """Membungkus setiap halaman agar error di satu file tidak merusak aplikasi."""
+    """Membungkus setiap halaman agar error di satu file tidak crash seluruh app."""
 
     @ui.page(path)
     def _page_wrapper():
-        # Halaman yang boleh diakses tanpa login
         is_standalone = path in ['/login', '/onboarding']
 
         try:
-            # A. Proteksi Login
+            # Proteksi Login: semua halaman kecuali /login butuh autentikasi
             if path != '/login' and not app.storage.user.get('authenticated'):
                 return ui.navigate.to('/login')
 
-            # B. Proteksi Onboarding
-            #    Kalau belum isi skin_type dan bukan di /onboarding, suruh isi dulu.
-            #    KECUALI: user sedang di mode 'edit' (datang dari tombol Edit Profil)
-            #    — dalam kasus itu, skin_type sudah ada, jadi tidak akan ter-redirect.
-            if (path not in ['/login', '/onboarding']
-                    and not app.storage.user.get('skin_type')):
-                return ui.navigate.to('/onboarding')
+            # ── TIDAK ADA cek skin_type di sini ──────────────────────────────
+            # skin_type dimuat dari DB oleh login_page → tidak perlu redirect
+            # ke onboarding setiap kali user buka halaman baru
 
-            # C. Import modul secara dinamis
             module = importlib.import_module(f'app.ui.pages.{module_name}')
             importlib.reload(module)
 
-            # D. Navbar & Sidebar hanya untuk halaman utama (bukan login/onboarding)
             if not is_standalone:
                 UIComponents.navbar()
                 UIComponents.sidebar()
